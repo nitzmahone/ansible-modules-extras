@@ -1,7 +1,7 @@
 #!powershell
 # This file is part of Ansible
 #
-# Copyright 2015, Matt Davis <mdavis@ansible.com>
+# Copyright 2015, Matt Davis <mdavis@rolpdog.com>
 #
 # Ansible is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -20,45 +20,41 @@
 # POWERSHELL_COMMON
 
 $ErrorActionPreference = "Stop"
+$FormatEnumerationLimit = -1 # prevent out-string et al from truncating collection dumps
 
-$job_body = 
-{
+<# Most of the Windows Update Agent API will not run under a remote token,
+which a remote WinRM session always has. win_updates uses the Task Scheduler
+to run the bulk of the update functionality under a local token. Powershell's
+Scheduled-Job capability provides a decent abstraction over the Task Scheduler
+and handles marshaling Powershell args in and output/errors/etc back. The
+module schedules a single job that executes all interactions with the Update
+Agent API, then waits for completion. A significant amount of hassle is
+involved to ensure that only one of these jobs is running at a time, and to
+clean up the various error conditions that can occur. #>
+
+# define the ScriptBlock that will be passed to Register-ScheduledJob
+$job_body = {
     Param(
     [hashtable]$boundparms=@{},
     [Object[]]$unboundargs=$()
     )
 
-    $ErrorActionPreference = "Stop"
-    $DebugPreference = "Continue"
-    
-    if(-not $(Test-Path variable:log_path)) { $log_path = $null }
-
     Set-StrictMode -Version 2
 
-    Function Write-DebugLog
-    {
-        Param(
-        [string]$msg
-        )
+    $ErrorActionPreference = "Stop"
+    $DebugPreference = "Continue"
+    $FormatEnumerationLimit = -1 # prevent out-string et al from truncating collection dumps
 
-        $DebugPreference = "Continue"
-        $date_str = Get-Date -Format u
-        $msg = "$date_str $msg"
-        Write-Debug $msg
+    # set this as a global for the Write-DebugLog function
+    $log_path = $boundparms['log_path']
 
-        if($log_path -ne $null)
-        {
-            Add-Content $log_path $msg
-        }
-    }
+    Write-DebugLog "Scheduled job started with boundparms $($boundparms | out-string) and unboundargs $($unboundargs | out-string)"
 
-    # TODO: elevate this to module arg validation once we have it
-    Function MapCategoryNameToGuid
-    {
-        Param([string] $CategoryName)
+    # FUTURE: elevate this to module arg validation once we have it
+    Function MapCategoryNameToGuid {
+        Param([string] $category_name)
 
-        $CategoryGUID = switch -exact ($CategoryName)
-        {
+        $category_guid = switch -exact ($category_name) {
             # as documented by TechNet @ https://technet.microsoft.com/en-us/library/ff730937.aspx
             "Application" {"5C9376AB-8CE6-464A-B136-22113DD69801"}
             "Connectors" {"434DE588-ED14-48F5-8EED-A15E09A991F6"}
@@ -72,20 +68,23 @@ $job_body =
             "Tools" {"B4832BD8-E735-4761-8DAF-37F882276DAB"}
             "UpdateRollups" {"28BC880E-0592-4CBF-8F95-C79B17911D5F"}
             "Updates" {"CD5FFD1E-E932-4E3A-BF74-18BF0B1BBD83"}
-            default { throw "Unknown CategoryName $CategoryName, must be one of (Application,Connectors,CriticalUpdates,DefinitionUpdates,DeveloperKits,FeaturePacks,Guidance,SecurityUpdates,ServicePacks,Tools,UpdateRollups,Updates)" }
+            default { throw "Unknown category_name $category_name, must be one of (Application,Connectors,CriticalUpdates,DefinitionUpdates,DeveloperKits,FeaturePacks,Guidance,SecurityUpdates,ServicePacks,Tools,UpdateRollups,Updates)" }
         }
 
-        return $CategoryGUID
+        return $category_guid
     }
 
-    Function DoWindowsUpdate
-    {
+    Function DoWindowsUpdate {
         Param(
-        [string]$CategoryName,
-        [bool]$IsCheckMode
+        [string[]]$category_names=@("CriticalUpdates","SecurityUpdates","UpdateRollups"),
+        [ValidateSet("installed", "searched")]
+        [string]$state="installed",
+        [bool]$_ansible_check_mode=$false
         )
-        
-        $CategoryGUID = MapCategoryNameToGUID $CategoryName
+
+        $is_check_mode = $($state -eq "searched") -or $_ansible_check_mode
+
+        $category_guids = $category_names | % { MapCategoryNameToGUID $_ }
 
         $update_status = @{ changed = $false }
 
@@ -95,8 +94,17 @@ $job_body =
         Write-DebugLog "Create Windows Update searcher..."
         $searcher = $session.CreateUpdateSearcher()
 
-        Write-DebugLog "Searching for updates to install in category IDs $CategoryGUID..."
-        $searchresult = $searcher.Search("IsInstalled = 0 and CategoryIDs contains '$CategoryGUID'")
+        # OR is only allowed at the top-level, so we have to repeat base criteria inside
+        # FUTURE: change this to client-side filtered?
+        $criteriabase = "IsInstalled = 0"
+        $criteria_list = $category_guids | % { "($criteriabase AND CategoryIDs contains '$_')" }
+
+        $criteria = [string]::Join(" OR ", $criteria_list)
+
+        Write-DebugLog "Search criteria: $criteria"
+
+        Write-DebugLog "Searching for updates to install in category IDs $category_guids..."
+        $searchresult = $searcher.Search($criteria)
 
         Write-DebugLog "Creating update collection..."
     
@@ -106,11 +114,9 @@ $job_body =
 
         $update_status.updates = @{ }
 
-        # TODO: add further filtering options
-        foreach($update in $searchresult.Updates)
-        {
-          if(-Not $update.EulaAccepted) 
-          {
+        # FUTURE: add further filtering options
+        foreach($update in $searchresult.Updates) {
+          if(-Not $update.EulaAccepted) {
             Write-DebugLog "Accepting EULA for $($update.Identity.UpdateID)"
             $update.AcceptEula()
           }
@@ -120,34 +126,42 @@ $job_body =
 
           $update_status.updates[$update.Identity.UpdateID] = @{
             title = $update.Title
-            # TODO: this assumes each update has exactly one KB ID
+            # TODO: pluck the first KB out (since most have just one)?
             kb = $update.KBArticleIDs
             id = $update.Identity.UpdateID
             installed = $false
           }
         }
 
+        Write-DebugLog "Calculating pre-install reboot requirement..."
+
         # calculate this early for check mode, and to see if we should allow updates to continue
         $sysinfo = New-Object -ComObject Microsoft.Update.SystemInfo
         $update_status.reboot_required = $sysinfo.RebootRequired
+        $update_status.found_update_count = $updates_to_install.Count
+        $update_status.installed_update_count = 0
 
         # bail out here for check mode  
-        if($IsCheckMode -eq $true) 
-        { 
+        if($is_check_mode -eq $true) { 
+          Write-DebugLog "Check mode; exiting..."
+          Write-DebugLog "Return value: $($update_status | out-string)"
+
           if($updates_to_install.Count -gt 0) { $update_status.changed = $true }
           return $update_status 
         }
 
-        if($updates_to_install.Count -gt 0) 
-        {   
-          if($update_status.reboot_required) { throw "A reboot is required before more updates can be installed."}
+        if($updates_to_install.Count -gt 0) {   
+          if($update_status.reboot_required) { 
+            throw "A reboot is required before more updates can be installed."
+          }
+          else {
+            Write-DebugLog "No reboot is pending..."
+          }
           Write-DebugLog "Downloading updates..." 
         }
 
-        foreach($update in $updates_to_install)
-        {
-            if($update.IsDownloaded)
-            { 
+        foreach($update in $updates_to_install) {
+            if($update.IsDownloaded) { 
                 Write-DebugLog "Update $($update.Identity.UpdateID) already downloaded, skipping..."
                 continue 
             }
@@ -159,124 +173,246 @@ $job_body =
             $res = $dl.Updates.Add($update)
             Write-DebugLog "Downloading update $($update.Identity.UpdateID)..."
             $download_result = $dl.Download()
-            # TODO: use OperationResultCode enum instead of int literals
-            # TODO: try/catch for better failure messaging (don't just throw an HRESULT)
-            if($download_result.ResultCode -ne 2) 
-            {
+            # FUTURE: configurable download retry
+            if($download_result.ResultCode -ne 2) { # OperationResultCode orcSucceeded
                 throw "Failed to download update $($update.Identity.UpdateID)"
             }
         }
 
-        if($updates_to_install.Count -gt 0) { Write-DebugLog "Installing updates..." }
+        if($updates_to_install.Count -lt 1 ) { return $update_status }
 
-        foreach($update in $updates_to_install)
-        {
-            Write-DebugLog "Creating installer object..."
-            $inst = $session.CreateUpdateInstaller()
-            Write-DebugLog "Creating install collection..."
-            $inst.Updates = New-Object -ComObject Microsoft.Update.UpdateColl
+        Write-DebugLog "Installing updates..."
+
+        # install as a batch so the reboot manager will suppress intermediate reboots
+        Write-DebugLog "Creating installer object..."
+        $inst = $session.CreateUpdateInstaller()
+        Write-DebugLog "Creating install collection..."
+        $inst.Updates = New-Object -ComObject Microsoft.Update.UpdateColl
+
+        foreach($update in $updates_to_install) {
             Write-DebugLog "Adding update $($update.Identity.UpdateID)"
             $res = $inst.Updates.Add($update)
-            Write-DebugLog "Installing update $($update.Identity.UpdateID)..."
-            $install_result = $inst.Install()
-            # TODO: use OperationResultCode enum instead of int literals
-            # TODO: try/catch for better failure messaging (don't just throw an HRESULT)
-            if($install_result.ResultCode -ne 2) 
-            {
-                throw "Failed to install update $($update.Identity.UpdateID) - status was $install_result"
-            }
-            else { $update_status.changed = $true }
-
-            $update_status.updates[$update.Identity.UpdateID].installed = $true
         }
+
+        # FUTURE: use BeginInstall w/ progress reporting so we can at least log intermediate install results
+        Write-DebugLog "Installing updates..."
+        $install_result = $inst.Install()
+
+        $update_success_count = 0
+        $update_fail_count = 0
+
+        # WU result API requires us to index in to get the install results
+        $update_index = 0
+
+        foreach($update in $updates_to_install) {
+          $update_result = $install_result.GetUpdateResult($update_index)
+          $update_resultcode = $update_result.ResultCode
+          $update_hresult = $update_result.HResult
+
+          $update_index++
+
+          $update_dict = $update_status.updates[$update.Identity.UpdateID]
+
+          if($update_resultcode -eq 2) { # OperationResultCode orcSucceeded
+            $update_success_count++
+            $update_dict.installed = $true
+            Write-DebugLog "Update $($update.Identity.UpdateID) succeeded"
+          }
+          else {
+            $update_fail_count++
+            $update_dict.installed = $false
+            $update_dict.failed = $true
+            $update_dict.failure_hresult_code = $update_hresult
+            Write-DebugLog "Update $($update.Identity.UpdateID) failed resultcode $update_hresult hresult $update_hresult"
+          }
+
+        }
+
+        if($update_fail_count -gt 0) {  
+            $update_status.failed = $true
+            $update_status.msg="Failed to install one or more updates"
+        }
+        else { $update_status.changed = $true }
+
+        Write-DebugLog "Performing post-install reboot requirement check..."
 
         # recalculate reboot status after installs
         $sysinfo = New-Object -ComObject Microsoft.Update.SystemInfo
         $update_status.reboot_required = $sysinfo.RebootRequired
+        $update_status.installed_update_count = $update_success_count
+        $update_status.failed_update_count = $update_fail_count
 
-        Write-DebugLog $($update_status | out-string)
-
-        Write-DebugLog "Done"
+        Write-DebugLog "Return value: $($update_status | out-string)"
 
         return $update_status
     }
 
-    Try
-    {
-        DoWindowsUpdate @boundparms @unboundargs
+    Try { 
+        # job system adds a bunch of cruft to top-level dict, so we have to send a sub-dict
+        return @{ job_output = DoWindowsUpdate @boundparms }
     }
-    Catch
-    {
-        return @{failed=$true;error=$_.Exception.Message;location=$_.ScriptStackTrace}
+    Catch {
+        $excep = $_
+        Write-DebugLog "Fatal exception: $($excep.Exception.Message) at $($excep.ScriptStackTrace)"
+        return @{ job_output = @{ failed=$true;error=$excep.Exception.Message;location=$excep.ScriptStackTrace } }
     }
 }
 
-Function RunAsScheduledJob {
-  Param([scriptblock] $job_body, [string] $jobname, [scriptblock] $job_init, [Object[]] $job_arg_list=@())
-  
-  # try to get a schduled job with the same name (should normally fail)
-  $schedjob = Get-ScheduledJob -Name $jobname -ErrorAction SilentlyContinue
+Function DestroyScheduledJob {
+  Param([string] $job_name)
+
+  # find a scheduled job with the same name (should normally fail)
+  $schedjob = Get-ScheduledJob -Name $job_name -ErrorAction SilentlyContinue
 
   # nuke it if it's there
-  # TODO: this can fail if the job is still running (maybe a good thing, maybe not)
-  # consider using generated job names + cleanup of dead/finished ones?
-  If ($schedjob -ne $null) {
-      Unregister-ScheduledJob -Name $jobname
+  If($schedjob -ne $null) {  
+      Write-DebugLog "ScheduledJob $job_name exists, ensuring it's not running..."
+      # can't manage jobs across sessions, so we have to resort to the Task Scheduler script object to kill running jobs
+      $schedserv = New-Object -ComObject Schedule.Service
+      Write-DebugLog "Connecting to scheduler service..."
+      $schedserv.Connect()
+      Write-DebugLog "Getting running tasks named $job_name"
+      $running_tasks = @($schedserv.GetRunningTasks(0) | Where-Object { $_.Name -eq $job_name })
+
+      Foreach($task_to_stop in $running_tasks) {
+          Write-DebugLog "Stopping running task $($task_to_stop.InstanceId)..."
+          $task_to_stop.Stop()
+      }
+
+      <# FUTURE: add a global waithandle for this to release any other waiters. Wait-Job 
+      and/or polling will block forever, since the killed job object in the parent 
+      session doesn't know it's been killed :( #>
+
+      Unregister-ScheduledJob -Name $job_name
   }
 
-  $schedjob = Register-ScheduledJob -ScriptBlock $job_body -Name $jobname -ArgumentList $job_arg_list -ErrorAction Stop
+}
 
-  # TODO: RunAsTask isn't available in PS3.0- consider a fallback code path using a schedule 2s in the future?
-  $schedjob.RunAsTask()
+Function RunAsScheduledJob {
+  Param([scriptblock] $job_body, [string] $job_name, [scriptblock] $job_init, [Object[]] $job_arg_list=@())
+
+  DestroyScheduledJob -job_name $job_name
+
+  $rsj_args = @{
+    ScriptBlock = $job_body
+    Name = $job_name
+    ArgumentList = $job_arg_list
+    ErrorAction = "Stop"
+    ScheduledJobOption = @{ RunElevated=$True }
+  }
+
+  if($job_init) { $rsj_args.InitializationScript = $job_init }
+
+  Write-DebugLog "Registering scheduled job with args $($rsj_args | Out-String -Width 300)"
+  $schedjob = Register-ScheduledJob @rsj_args
+
+  # RunAsTask isn't available in PS3- fall back to a 2s future trigger
+  if($schedjob.RunAsTask) {
+    Write-DebugLog "Starting scheduled job (PS4 method)"
+    $schedjob.RunAsTask()
+  }
+  else {
+    Write-DebugLog "Starting scheduled job (PS3 method)"
+    Add-JobTrigger -inputobject $schedjob -trigger $(New-JobTrigger -once -at $(Get-Date).AddSeconds(2))      
+  }
 
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
   $job = $null
 
-  while ($job -eq $null)
-  {
+  Write-DebugLog "Waiting for job completion..."
+
+  # Wait-Job can fail for a few seconds until the scheduled task starts- poll for it...
+  while ($job -eq $null) {
       start-sleep -Milliseconds 100
-      if($sw.ElapsedMilliseconds -ge 5000)
-      {
-        Throw "Timed out waiting for download task to start"
+      if($sw.ElapsedMilliseconds -ge 30000) { # tasks scheduled right after boot on 2008R2 can take awhile to start...
+        Throw "Timed out waiting for scheduled task to start"
       }
+
+      # FUTURE: configurable timeout so we don't block forever?
+      # FUTURE: add a global WaitHandle in case another instance kills our job, so we don't block forever
       $job = Wait-Job -Name $schedjob.Name -ErrorAction SilentlyContinue 
   }
- 
-  # receive-job often returns null even when we got valid output; ignore its output and use $job.Output instead, which is much more reliable
-  $jobout_discard = Receive-Job -Job $job -Keep
 
-  # try to nuke the task entry
-  Unregister-ScheduledJob -Name $jobname -ErrorAction SilentlyContinue
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
-  Write-Debug $($job.Output | out-string)
+  # NB: output from scheduled jobs is delayed after completion (including the sub-objects after the primary Output object is available)
+  While (($job.Output -eq $null -or $job.Output.job_output -eq $null) -and $sw.ElapsedMilliseconds -lt 15000) {
+    Write-DebugLog "Waiting for job output to be non-null..."
+    Start-Sleep -Milliseconds 500
+  }
 
-  $ret = @{}
+  # NB: fallthru on both timeout and success
 
-  $ret.ErrorOutput = $job.Error
-  $ret.WarningOutput = $job.Warning
-  $ret.Output = $job.Output
-  # TODO: filter extra system-added junk from the output dict (PSComputerName, PSShowComputerName, RunspaceId)
-  $ret.VerboseOutput = $job.Verbose
-  $ret.DebugOutput = $job.Debug
+  $ret = @{
+      ErrorOutput = $job.Error
+      WarningOutput = $job.Warning
+      VerboseOutput = $job.Verbose
+      DebugOutput = $job.Debug
+  }
+
+  If ($job.Output -eq $null -or $job.Output.job_output -eq $null) {
+      $ret.Output = @{failed = $true; msg = "job output was lost"}
+  }
+  Else {
+      $ret.Output = $job.Output.job_output # sub-object returned, can only be accessed as a property for some reason
+  }
+
+  Try { # this shouldn't be fatal, but can fail with both Powershell errors and COM Exceptions, hence the dual error-handling... 
+      Unregister-ScheduledJob -Name $job_name -Force -ErrorAction Continue
+  }
+  Catch {
+      Write-DebugLog "Error unregistering job after execution: $($_.Exception.ToString()) $($_.ScriptStackTrace)"
+  }
 
   return $ret
-
 }
 
-if($args -contains "-Interactive")
-{
-
-}
-else {
-  $parsed_args = Parse-Args $args
-  # grr, why use PSCustomObject for args instead of just native hashtable?
-  $parsed_args.psobject.properties | foreach -begin {$job_args=@{}} -process {$job_args."$($_.Name)" = $_.Value} -end {$job_args}
-
-  # make booleans actual booleans
-  $job_args['IsCheckMode'] = [System.Convert]::ToBoolean($job_args['IsCheckMode'])
+Function Log-Forensics {
+    Write-DebugLog "Arguments: $job_args | out-string"
+    Write-DebugLog "OS Version: $([environment]::OSVersion.Version | out-string)"
+    Write-DebugLog "Running as user: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+    # FUTURE: log auth method (kerb, password, etc)
 }
 
-$sjo = RunAsScheduledJob -job_body $job_body -jobname ansible-win-updates -job_arg_list $job_args
+# code shared between the scheduled job and the host script
+$common_inject = {
+    # FUTURE: capture all to a list, dump on error
+    Function Write-DebugLog {
+        Param(
+        [string]$msg
+        )
+
+        $DebugPreference = "Continue"
+        $ErrorActionPreference = "Continue"
+        $date_str = Get-Date -Format u
+        $msg = "$date_str $msg"
+
+        Write-Debug $msg
+
+        if($log_path -ne $null) {
+            Add-Content $log_path $msg
+        }
+    }
+}
+
+# source the common code into the current scope so we can call it
+. $common_inject
+
+$parsed_args = Parse-Args $args $true
+# grr, why use PSCustomObject for args instead of just native hashtable?
+$parsed_args.psobject.properties | foreach -begin {$job_args=@{}} -process {$job_args."$($_.Name)" = $_.Value} -end {$job_args}
+
+# set the log_path for the global log function we injected earlier
+$log_path = $job_args.log_path
+
+Log-Forensics
+
+Write-DebugLog "Starting scheduled job with args: $($job_args | Out-String -Width 300)"
+
+# pass the common code as job_init so it'll be injected into the scheduled job script
+$sjo = RunAsScheduledJob -job_init $common_inject -job_body $job_body -job_name ansible-win-updates -job_arg_list $job_args
+
+Write-DebugLog "Scheduled job completed with output: $($sjo.Output | Out-String -Width 300)"
 
 Exit-Json $sjo.Output
